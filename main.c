@@ -40,6 +40,8 @@
 #define FW_PAGE_SIZE	0x400
 #define FW_MAX_PAGES	(FW_MAX_LEN / FW_PAGE_SIZE)
 #define FW_CRC_ADDR		0x0FE00000
+#define FW_VECTORS_SIZE	0x94
+#define FW_VER_ADDR		(FW_BASE_ADDR + FW_VECTORS_SIZE)
 
 #define XMODEM_SOH		0x01
 #define XMODEM_EOT		0x04
@@ -56,7 +58,7 @@
 #define XMODEM_STATE_STORE	3
 #define XMODEM_STATE_END	4
 
-static const uint8_t confirm_string[] = "Press any key to start firmware download...";
+#define BOOTLOADER_VERSION	"1.0"
 
 typedef struct
 {
@@ -82,6 +84,7 @@ static FW_CRC* fw_crc = (FW_CRC*) FW_CRC_ADDR;
 static XMODEM_PACKET rx_packet;
 static uint8_t next_seq;
 static uint32_t curr_addr = FW_BASE_ADDR;
+static char* fw_ver = (char*) FW_VER_ADDR;
 
 static void delay_ms(uint32_t ms)
 {
@@ -98,9 +101,6 @@ static void uart_init(void)
 {
 	USART_InitAsync_TypeDef init = USART_INITASYNC_DEFAULT;
 
-	GPIO_PinModeSet(gpioPortC, 0, gpioModePushPull, 1);
-	GPIO_PinModeSet(gpioPortC, 1, gpioModeInput, 0);
-
 	CMU_ClockEnable(cmuClock_USART1, true);
 	USART_InitAsync(USART1, &init);
 	USART1->ROUTE = USART_ROUTE_RXPEN | USART_ROUTE_TXPEN | USART_ROUTE_LOCATION_LOC0;
@@ -112,8 +112,6 @@ static void uart_deinit(void)
 
 	USART_Reset(USART1);
 	CMU_ClockEnable(cmuClock_USART1, false);
-	GPIO_PinModeSet(gpioPortC, 0, gpioModeDisabled, 0);
-	GPIO_PinModeSet(gpioPortC, 1, gpioModeDisabled, 0);
 }
 
 static void gpio_init(void)
@@ -127,12 +125,23 @@ static void gpio_init(void)
 	/* LED on PB14 */
 	GPIO_PinModeSet(gpioPortB, 14, gpioModePushPull, 0);
 	GPIO_PinOutSet(gpioPortB, 14);
+
+	/* UART pins */
+	GPIO_PinModeSet(gpioPortC, 0, gpioModePushPull, 1);
+	GPIO_PinModeSet(gpioPortC, 1, gpioModeInput, 0);
 }
 
 static void gpio_deinit(void)
 {
+	/* LED on PB14 */
 	GPIO_PinModeSet(gpioPortB, 14, gpioModeInput, 0);
+
+	/* Boot button on PA0 */
 	GPIO_PinModeSet(gpioPortA, 0, gpioModeInput, 0);
+
+	/* UART pins */
+	GPIO_PinModeSet(gpioPortC, 0, gpioModeDisabled, 0);
+	GPIO_PinModeSet(gpioPortC, 1, gpioModeDisabled, 0);
 }
 
 static void flash_write(uint8_t* data, uint32_t len)
@@ -229,15 +238,33 @@ static uint8_t xmodem_verify(XMODEM_PACKET* packet)
 	return (crc == calc_crc);
 }
 
-static void print_string(const uint8_t* string)
+static void print_char(const char c)
 {
-	while (*string)
-		USART_Tx(USART1, *string++);
+	USART_Tx(USART1, c);
 }
 
-static uint8_t xmodem_download(uint8_t confirm)
+static void print_string(const char* string)
 {
-	uint8_t c;
+	while (*string)
+		print_char(*string++);
+}
+
+static void print_bootloader_version(void)
+{
+	print_string("\r\nArtekit Labs - Bootloader for AK-CMSIS-DAP - version ");
+	print_string(BOOTLOADER_VERSION);
+	print_string("\r\n");
+}
+
+static void print_fw_version(void)
+{
+	print_string("AK-CMSIS-DAP firmware version ");
+	print_string(fw_ver);
+	print_string("\r\n");
+}
+
+static uint8_t xmodem_download()
+{
 	uint32_t timeout = 0;
 	FW_CRC new_crc;
 	uint8_t state = 0;
@@ -245,13 +272,12 @@ static uint8_t xmodem_download(uint8_t confirm)
 	uint8_t ret = 0;
 	uint8_t first_time = 1;
 	
-	uart_init();
-	
-	if (confirm)
-	{
-		print_string(confirm_string);
-		USART_Rx(USART1);
-	}
+	/* Read any spurious UART data */
+	while (USART1->STATUS & USART_STATUS_RXDATAV)
+		USART1->RXDATA;
+
+	print_string("Press any key to start firmware download...\r\n");
+	USART_Rx(USART1);
 
 	while (1)
 	{
@@ -260,7 +286,7 @@ static uint8_t xmodem_download(uint8_t confirm)
 			case XMODEM_STATE_START:
 				/* Read any spurious UART data */
 				while (USART1->STATUS & USART_STATUS_RXDATAV)
-					c = USART1->RXDATA;
+					USART1->RXDATA;
 
 				next_seq = 1;
 				curr_addr = FW_BASE_ADDR;
@@ -358,7 +384,6 @@ static uint8_t xmodem_download(uint8_t confirm)
 
 			case XMODEM_STATE_END:
 				GPIO_PinOutSet(gpioPortB, 14);
-				uart_deinit();
 				MSC_Deinit();
 				return ret;
 		}
@@ -398,6 +423,8 @@ static void jump_to_app()
 int main(void)
 {
 	uint32_t freq;
+	uint8_t crc_good;
+	uint8_t button_pressed;
 	
 	/* Chip errata */
 	CHIP_Init();
@@ -405,25 +432,41 @@ int main(void)
 	freq = SystemCoreClockGet();
 
 	SysTick_Config((freq / 1000) - 1);
-	gpio_init();
 
+	gpio_init();
+	uart_init();
 	delay_ms(100);
 
-	/* Check firmware CRC */
-	if (!check_fw_crc())
+	print_bootloader_version();
+
+	while (1)
 	{
-		/* Download without confirmation */
-		xmodem_download(0);
-	} else if (check_boot_button())
-	{
-		/* Download with confirmation */		
-		xmodem_download(1);
+		/* Check firmware CRC */
+		crc_good = check_fw_crc();
+		if (crc_good)
+			print_fw_version();
+		else
+			print_string("Invalid firmware CRC\r\n");
+
+		button_pressed = check_boot_button();
+		if (button_pressed)
+			print_string("Firmware download triggered by BOOT button\r\n");
+
+		if (button_pressed || !crc_good)
+		{
+			if (xmodem_download(0))
+				print_string("\r\nFirmware download succeeded\r\n");
+			else
+				print_string("\r\nFirmware download failed\r\n");
+		} else break;
 	}
 
+	print_string("Jumping to main program...\r\n");
+	uart_deinit();
 	gpio_deinit();
-	SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk;
+	delay_ms(100);
 
-	/* Jump to main app */
+	SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk;
 	jump_to_app();
 	while(1);
 }
