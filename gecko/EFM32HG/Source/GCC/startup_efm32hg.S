@@ -202,6 +202,7 @@ Reset_Handler:
  *  Define macro __STARTUP_CLEAR_BSS_MULTIPLE to choose the former.
  *  Otherwise efine macro __STARTUP_CLEAR_BSS to choose the later.
  */
+#define __STARTUP_CLEAR_BSS
 #ifdef __STARTUP_CLEAR_BSS_MULTIPLE
 /*  Multiple sections scheme.
  *
@@ -256,7 +257,7 @@ Reset_Handler:
 #ifndef __START
 #define __START _start
 #endif
-    bl      __START
+    bl      main
 
     .pool
     .size   Reset_Handler, . - Reset_Handler
